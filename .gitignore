@@ -1,0 +1,9 @@
+/target
+
+# token 是密钥，不要提交
+.env
+
+# 设了 LOG_FILE 时可能生成的日志
+*.log
+
+.claude

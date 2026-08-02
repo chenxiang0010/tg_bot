@@ -1,0 +1,29 @@
+[Unit]
+Description=Telegram 表情包转图标机器人
+Documentation=file://@ROOT@/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+# token 从工作目录下的 .env 读取
+ExecStart=@ROOT@/target/release/tg_bot
+Environment=RUST_LOG=info
+# 想额外写一份日志文件就取消下面这行的注释，然后 systemctl --user restart tg-bot
+#Environment=LOG_FILE=@ROOT@/tg_bot.log
+
+# 挂了就自动拉起来
+Restart=always
+RestartSec=5s
+
+# 日志交给 journald：journalctl --user -u tg-bot -f
+StandardOutput=journal
+StandardError=journal
+
+# 基本加固：本身不写任何临时文件，也不需要提权
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
