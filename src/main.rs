@@ -79,7 +79,16 @@ async fn main() -> Result<()> {
     let token = std::env::var("TELOXIDE_TOKEN").context(
         "没读到 TELOXIDE_TOKEN，请在项目根目录的 .env 里写上 TELOXIDE_TOKEN=<你的 token>",
     )?;
-    let bot = Bot::new(token);
+
+    // teloxide 默认的 HTTP 客户端只给 17 秒超时 —— 上传几十 MB 的压缩包
+    // 稳稳地超时（operation timed out）。整套表情包压出来能有 40MB，
+    // 得给够时间。轮询那边不受影响：长轮询本身只要 30 秒。
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .context("建 HTTP 客户端失败")?;
+    let bot = Bot::with_client(token, client);
 
     let ffmpeg = video::probe();
     match (ffmpeg.available, ffmpeg.libvpx_vp9) {
@@ -189,16 +198,33 @@ struct Converted {
 /// 靠后缀判断容易在改名、扩展名变化时出错。
 #[derive(Clone)]
 struct Packed {
-    /// zip 里的条目名，例如 `001_sticker_1.png`。
-    name: String,
+    /// 原表情包里的序号（1 起），zip 里当文件名前缀。
+    index: usize,
+    /// 文件名主干（不含序号和扩展名）。
+    stem: String,
     bytes: Vec<u8>,
     /// 输出格式：静态 `png`，动图 `gif`。
     ext: &'static str,
+    /// 能不能降级成静态 PNG —— 有 Telegram 给的缩略图才行。
+    can_downgrade: bool,
 }
 
 impl Packed {
+    /// zip 里的条目名，例如 `001_of436_by_fStikBot_AgAD.png`。
+    fn name(&self) -> String {
+        format!("{:03}_{}.{}", self.index, self.stem, self.ext)
+    }
+
     fn is_gif(&self) -> bool {
         self.ext == "gif"
+    }
+
+    /// 这个条目大概占多少上传额度。
+    ///
+    /// 数据本身加上本地头 + 中央目录，名字按 UTF-16 长度算。
+    fn cost(&self) -> usize {
+        const ENTRY_OVERHEAD: usize = 128;
+        self.bytes.len() + self.name().len() * 2 + ENTRY_OVERHEAD
     }
 }
 
@@ -543,37 +569,54 @@ async fn convert_pack(bot: &Bot, msg: &Message, arg: &str, ffmpeg: Ffmpeg) -> Re
         .await
         .ok();
 
+    // 每张 GIF 的体积上限要跟着整套张数走。
+    //
+    // GIF 没有帧间压缩，一张 115KB 的 webm 能编出 1MB 的 GIF。一套 74 张按
+    // 每张 1MB 算就是 74MB，远超 45MB 的上传上限 —— 结果就是白白丢掉三十几张。
+    // 按张数分摊额度（74 张 → 每张 620KB），GIF 编码器自己会降档，
+    // 整套才装得下。
+    let per_file = video::PACK_SOFT_LIMIT.min(MAX_UPLOAD / picked.len().max(1));
+
     // 有限并发地下载 + 转换，结果保持原顺序
-    let converted: Vec<Result<Packed>> = stream::iter(picked.into_iter().enumerate())
-        .map(|(i, sticker)| async move {
-            let source =
-                sticker_source(&sticker, ffmpeg).with_context(|| format!("第 {} 张失败", i + 1))?;
-            let out = convert_media(
-                bot,
-                &source,
-                ffmpeg,
-                args.format,
-                &video::PACK_LADDER,
-                video::PACK_SOFT_LIMIT,
-            )
-            .await
-            .with_context(|| format!("第 {} 张失败", i + 1))?;
-            // 加序号前缀，解压出来能保持表情包原本的顺序
-            Ok(Packed {
-                name: format!("{:03}_{}.{}", i + 1, source.stem, out.ext),
-                bytes: out.bytes,
-                ext: out.ext,
+    let converted: Vec<Result<(usize, Source, Converted)>> =
+        stream::iter(picked.into_iter().enumerate())
+            .map(|(i, sticker)| async move {
+                let source = sticker_source(&sticker, ffmpeg)
+                    .with_context(|| format!("第 {} 张失败", i + 1))?;
+                let out = convert_media(
+                    bot,
+                    &source,
+                    ffmpeg,
+                    args.format,
+                    &video::PACK_LADDER,
+                    per_file,
+                )
+                .await
+                .with_context(|| format!("第 {} 张失败", i + 1))?;
+                Ok((i + 1, source, out))
             })
-        })
-        .buffered(PACK_CONCURRENCY)
-        .collect()
-        .await;
+            .buffered(PACK_CONCURRENCY)
+            .collect()
+            .await;
 
     let mut files = Vec::new();
+    let mut sources = Vec::new();
     let mut failures = Vec::new();
     for result in converted {
         match result {
-            Ok(item) => files.push(item),
+            Ok((index, source, out)) => {
+                files.push(Packed {
+                    // 序号是原表情包里的位置：转失败的那张留成缺口，
+                    // 正好告诉用户少了哪几张
+                    index,
+                    stem: source.stem.clone(),
+                    bytes: out.bytes,
+                    ext: out.ext,
+                    // 动图有缩略图才能降级成静态 PNG
+                    can_downgrade: out.ext == "gif" && source.fallback.is_some(),
+                });
+                sources.push(source);
+            }
             Err(e) => failures.push(format!("{e:#}")),
         }
     }
@@ -584,6 +627,14 @@ async fn convert_pack(bot: &Bot, msg: &Message, arg: &str, ffmpeg: Ffmpeg) -> Re
     let converted_count = files.len();
     // 混合格式下 GIF 是体积大头，超预算时提示用户改走纯静态
     let has_gif = files.iter().any(|f| f.is_gif());
+
+    // 装不下的时候先把动图降级成静态 PNG（缩略图才几 KB），
+    // 实在装不下才丢 —— 丢贴纸是最后手段。
+    let downgraded = match args.delivery {
+        Delivery::Zip => downgrade_to_still(bot, &mut files, &sources).await?,
+        Delivery::Files => 0,
+    };
+
     let over_budget = match args.delivery {
         Delivery::Zip => send_as_zip(bot, msg, &set_name, &set.title, files).await?,
         Delivery::Files => {
@@ -601,10 +652,49 @@ async fn convert_pack(bot: &Bot, msg: &Message, arg: &str, ffmpeg: Ffmpeg) -> Re
         over_cap,
         over_budget,
         has_gif,
+        downgraded,
         failures: &failures,
     });
     bot.send_message(msg.chat.id, summary).await?;
     Ok(())
+}
+
+/// 动图装不下时降级成它的静态版本（缩略图 → 方形 PNG）。
+///
+/// 缩略图才几 KB，几乎肯定装得下 —— 总比把贴纸整张丢了强。
+/// 返回降级了几张。
+async fn downgrade_to_still(bot: &Bot, files: &mut [Packed], sources: &[Source]) -> Result<usize> {
+    let mut changed = 0;
+    loop {
+        if files.iter().map(|f| f.cost()).sum::<usize>() <= MAX_UPLOAD {
+            break;
+        }
+        // 挑最大的那张还能降级的动图
+        let Some(idx) = files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.is_gif() && f.can_downgrade)
+            .max_by_key(|(_, f)| f.bytes.len())
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+
+        let thumbnail = sources[idx]
+            .fallback
+            .as_ref()
+            .context("这个条目没有缩略图，降不了级")?;
+        let data = download(bot, thumbnail).await?;
+        let icon = tokio::task::spawn_blocking(move || icon::convert(&data))
+            .await
+            .context("转换任务被中断")??;
+
+        files[idx].bytes = icon.bytes;
+        files[idx].ext = "png";
+        files[idx].can_downgrade = false;
+        changed += 1;
+    }
+    Ok(changed)
 }
 
 /// 一套转换的统计结果，用来拼最后那条总结。
@@ -622,6 +712,8 @@ struct PackSummary<'a> {
     over_budget: usize,
     /// 这一套里有没有 GIF。
     has_gif: bool,
+    /// 装不下、被降级成静态 PNG 的张数。
+    downgraded: usize,
     /// 每张失败的原因。
     failures: &'a [String],
 }
@@ -635,6 +727,12 @@ fn build_summary(s: &PackSummary) -> String {
         summary.push_str(&format!(
             "\n⚠️ 单次上限 {} 张，剩下 {} 张没转",
             s.cap, s.over_cap
+        ));
+    }
+    if s.downgraded > 0 {
+        summary.push_str(&format!(
+            "\nℹ️ {} 张动图装不下，降级成了静态 PNG",
+            s.downgraded
         ));
     }
     if s.over_budget > 0 {
@@ -692,7 +790,7 @@ async fn send_as_files(bot: &Bot, msg: &Message, files: Vec<Packed>) -> Result<(
     for chunk in files.chunks(MEDIA_GROUP) {
         // sendMediaGroup 要求 2~10 个条目，落单的那张走 sendDocument
         if let [one] = chunk {
-            let file = InputFile::memory(one.bytes.clone()).file_name(one.name.clone());
+            let file = InputFile::memory(one.bytes.clone()).file_name(one.name());
             bot.send_document(msg.chat.id, file)
                 .disable_content_type_detection(true)
                 .await?;
@@ -701,7 +799,7 @@ async fn send_as_files(bot: &Bot, msg: &Message, files: Vec<Packed>) -> Result<(
         let group: Vec<InputMedia> = chunk
             .iter()
             .map(|item| {
-                let file = InputFile::memory(item.bytes.clone()).file_name(item.name.clone());
+                let file = InputFile::memory(item.bytes.clone()).file_name(item.name());
                 InputMedia::Document(InputMediaDocument::new(file))
             })
             .collect();
@@ -717,10 +815,11 @@ fn build_zip(files: &[Packed]) -> Result<Vec<u8>> {
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
     for item in files {
+        let name = item.name();
         writer
-            .start_file(item.name.as_str(), options)
+            .start_file(name.as_str(), options)
             .and_then(|()| writer.write_all(&item.bytes).map_err(Into::into))
-            .with_context(|| format!("往 zip 里写 {} 失败", item.name))?;
+            .with_context(|| format!("往 zip 里写 {name} 失败"))?;
     }
 
     Ok(writer.finish().context("生成 zip 失败")?.into_inner())
@@ -732,15 +831,8 @@ fn build_zip(files: &[Packed]) -> Result<Vec<u8>> {
 /// 装不下时**优先丢 GIF**：静态的那部分体积小得多，而且单独再发一次就能补回来；
 /// 按顺序截断则会把尾部一整段砍掉，混合包里那一段可能正好全是用户想要的素材。
 fn fit_upload_budget(files: &mut Vec<Packed>) -> usize {
-    // 每个条目除了数据本身还有本地头 + 中央目录，估 128 字节余量
-    const ENTRY_OVERHEAD: usize = 128;
-
-    fn cost_of(item: &Packed) -> usize {
-        item.bytes.len() + item.name.len() * 2 + ENTRY_OVERHEAD
-    }
-
     // 先算所有条目的开销，总体积超了就从最大的 GIF 开始丢。
-    let mut total: usize = files.iter().map(cost_of).sum();
+    let mut total: usize = files.iter().map(|f| f.cost()).sum();
     if total <= MAX_UPLOAD {
         return 0;
     }
@@ -759,7 +851,7 @@ fn fit_upload_budget(files: &mut Vec<Packed>) -> usize {
         if total <= MAX_UPLOAD {
             break;
         }
-        total -= cost_of(&files[i]);
+        total -= files[i].cost();
         dropped_set.insert(i);
     }
 
@@ -776,7 +868,7 @@ fn fit_upload_budget(files: &mut Vec<Packed>) -> usize {
             if total <= MAX_UPLOAD {
                 break;
             }
-            total -= cost_of(&files[i]);
+            total -= files[i].cost();
             dropped_set.insert(i);
         }
     }
@@ -1211,6 +1303,7 @@ mod tests {
             over_cap: 0,
             over_budget: 0,
             has_gif: false,
+            downgraded: 0,
             failures: &[],
         });
         assert_eq!(plain, "✅《MyPack》完成，发回 10/10 张");
@@ -1224,6 +1317,7 @@ mod tests {
             over_cap: 80,
             over_budget: 0,
             has_gif: false,
+            downgraded: 0,
             failures: &[],
         });
         assert!(
@@ -1239,6 +1333,7 @@ mod tests {
             over_cap: 0,
             over_budget: 5,
             has_gif: true,
+            downgraded: 0,
             failures: &[],
         });
         assert!(
@@ -1256,6 +1351,7 @@ mod tests {
             over_cap: 0,
             over_budget: 5,
             has_gif: false,
+            downgraded: 0,
             failures: &[],
         });
         assert!(
@@ -1271,6 +1367,7 @@ mod tests {
             over_cap: 0,
             over_budget: 0,
             has_gif: false,
+            downgraded: 0,
             failures: &["第 3 张失败".to_string()],
         });
         assert!(failed.contains("1 张失败：第 3 张失败"), "{failed}");
@@ -1289,22 +1386,24 @@ mod tests {
     }
 
     /// 造一个打包条目。
-    fn packed(name: &str, ext: &str, bytes: Vec<u8>) -> Packed {
+    fn packed(index: usize, stem: &str, ext: &str, bytes: Vec<u8>) -> Packed {
         Packed {
-            name: name.to_string(),
+            index,
+            stem: stem.to_string(),
             bytes,
             ext: match ext {
                 "gif" => "gif",
                 _ => "png",
             },
+            can_downgrade: false,
         }
     }
 
     #[test]
     fn zip_contains_every_file() {
         let files = vec![
-            packed("001_a.png", "png", vec![1u8; 100]),
-            packed("002_b.gif", "gif", vec![2u8; 200]),
+            packed(1, "a", "png", vec![1u8; 100]),
+            packed(2, "b", "gif", vec![2u8; 200]),
         ];
         let archive = build_zip(&files).unwrap();
 
@@ -1318,15 +1417,15 @@ mod tests {
     fn upload_budget_drops_what_does_not_fit() {
         let big = MAX_UPLOAD / 2;
         let mut files = vec![
-            packed("a.png", "png", vec![0u8; big]),
-            packed("b.png", "png", vec![0u8; big]),
-            packed("c.png", "png", vec![0u8; big]),
+            packed(1, "a", "png", vec![0u8; big]),
+            packed(2, "b", "png", vec![0u8; big]),
+            packed(3, "c", "png", vec![0u8; big]),
         ];
         assert_eq!(fit_upload_budget(&mut files), 2);
         assert_eq!(files.len(), 1);
 
         // 装得下就一个都不丢
-        let mut small = vec![packed("a.png", "png", vec![0u8; 10])];
+        let mut small = vec![packed(1, "a", "png", vec![0u8; 10])];
         assert_eq!(fit_upload_budget(&mut small), 0);
         assert_eq!(small.len(), 1);
     }
@@ -1337,9 +1436,9 @@ mod tests {
         // 两个各占 55% 的大 GIF + 一个小 PNG：装不下，丢一个 GIF 后就装得下
         let gif = MAX_UPLOAD * 11 / 20;
         let mut files = vec![
-            packed("001_a.gif", "gif", vec![0u8; gif]),
-            packed("002_b.png", "png", vec![0u8; 1024]),
-            packed("003_c.gif", "gif", vec![0u8; gif]),
+            packed(1, "a", "gif", vec![0u8; gif]),
+            packed(2, "b", "png", vec![0u8; 1024]),
+            packed(3, "c", "gif", vec![0u8; gif]),
         ];
         let dropped = fit_upload_budget(&mut files);
         assert_eq!(dropped, 1);
@@ -1347,7 +1446,7 @@ mod tests {
         assert!(
             files.iter().any(|f| f.ext == "png"),
             "静态 PNG 不该被优先丢掉：{:?}",
-            files.iter().map(|f| &f.name).collect::<Vec<_>>()
+            files.iter().map(|f| f.name()).collect::<Vec<_>>()
         );
         assert_eq!(files.iter().filter(|f| f.is_gif()).count(), 1);
     }
@@ -1361,17 +1460,9 @@ mod tests {
         for i in 1..=60u32 {
             if i % 3 == 0 {
                 // 大 GIF：2.25MB 一个，20 个共 45MB
-                files.push(packed(
-                    &format!("{i:03}_s{i}.gif"),
-                    "gif",
-                    vec![0u8; MAX_UPLOAD / 20],
-                ));
+                files.push(packed(i as usize, "s", "gif", vec![0u8; MAX_UPLOAD / 20]));
             } else {
-                files.push(packed(
-                    &format!("{i:03}_s{i}.png"),
-                    "png",
-                    vec![0u8; 40 * 1024],
-                ));
+                files.push(packed(i as usize, "s", "png", vec![0u8; 40 * 1024]));
             }
         }
         let before = files.len();
@@ -1379,10 +1470,7 @@ mod tests {
         assert!(dropped > 0, "超限了却一个都没丢");
         assert_eq!(before - dropped, files.len());
 
-        let nums: Vec<u32> = files
-            .iter()
-            .map(|f| f.name[..3].parse::<u32>().unwrap())
-            .collect();
+        let nums: Vec<u32> = files.iter().map(|f| f.index as u32).collect();
         // 顺序不变，但中间有缺口（不是截掉尾部）
         assert!(
             nums.windows(2).all(|w| w[1] > w[0]),
@@ -1399,12 +1487,12 @@ mod tests {
     fn upload_budget_keeps_original_order() {
         let gif = MAX_UPLOAD * 11 / 20;
         let mut files = vec![
-            packed("001_a.gif", "gif", vec![0u8; gif]),
-            packed("002_b.png", "png", vec![0u8; 1024]),
-            packed("003_c.png", "png", vec![0u8; 1024]),
+            packed(1, "a", "gif", vec![0u8; gif]),
+            packed(2, "b", "png", vec![0u8; 1024]),
+            packed(3, "c", "png", vec![0u8; 1024]),
         ];
         fit_upload_budget(&mut files);
-        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        let names: Vec<String> = files.iter().map(|f| f.name()).collect();
         assert!(
             names.windows(2).all(|w| w[0] < w[1]),
             "顺序被打乱了：{names:?}"
@@ -1415,14 +1503,31 @@ mod tests {
     #[test]
     fn gif_detection_follows_the_data_not_the_file_name() {
         let renamed = Packed {
-            name: "001_weird.png".to_string(),
+            index: 1,
+            stem: "weird".to_string(),
             bytes: vec![0u8; 10],
             ext: "gif",
+            can_downgrade: false,
         };
         assert!(renamed.is_gif());
+        // 文件名是 .png，扩展名说是 GIF —— 认扩展名
+        assert_eq!(renamed.name(), "001_weird.gif");
 
-        let normal = packed("001_a.gif", "png", vec![0u8; 10]);
+        let normal = packed(1, "a", "png", vec![0u8; 10]);
         assert!(!normal.is_gif());
+    }
+
+    /// 每张的额度按张数分摊，整套才装得下。
+    #[test]
+    fn per_file_budget_scales_with_the_pack_size() {
+        // 74 张：每张 45MB/74 ≈ 620KB
+        let per_file = video::PACK_SOFT_LIMIT.min(MAX_UPLOAD / 74);
+        assert!(per_file < video::PACK_SOFT_LIMIT, "74 张不该还按 1MB 算");
+        assert!(per_file > 500_000 && per_file < 700_000, "{per_file}");
+
+        // 张数少的时候还是按单张的上限来
+        let per_file = video::PACK_SOFT_LIMIT.min(MAX_UPLOAD / 3);
+        assert_eq!(per_file, video::PACK_SOFT_LIMIT);
     }
 
     #[test]
