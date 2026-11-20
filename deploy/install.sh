@@ -3,6 +3,13 @@
 # 全程不需要 sudo。
 set -euo pipefail
 
+# rlottie-sys 的构建脚本会在它 clone 的源码里 cherry-pick 一个补丁。
+# 如果全局开启了 commit.gpgsign 但没有可用私钥，git 会在这里签名失败。
+# 只对本次构建禁用签名，不改用户的全局 git 配置。
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=commit.gpgsign
+export GIT_CONFIG_VALUE_0=false
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="$UNIT_DIR/tg-bot.service"
