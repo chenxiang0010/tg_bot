@@ -63,6 +63,17 @@ if command -v ffmpeg >/dev/null; then
 fi
 
 echo "==> 编译 release 版（首次会现场编译 rlottie，要联网且需要几分钟）"
+
+# rlottie-sys 的构建脚本每次重跑都会先 git checkout v0.2 再 cherry-pick 那个补丁。
+# 上一轮 cherry-pick 改过的文件这时候是「本地修改」，git 会拒绝：
+#   error: your local changes would be overwritten by cherry-pick
+# 所以先把缓存下来的上游源码复位成干净的 v0.2 —— 动的只是 cargo 构建缓存里的
+# 第三方 clone，补丁构建脚本会自己重新打上，不碰任何用户文件。
+for src in "$ROOT"/target/*/build/rlottie-sys/*/out/rlottie-samsung-v0.2; do
+    [[ -d "$src/.git" ]] || continue
+    git -C "$src" reset --hard v0.2 >/dev/null 2>&1 || true
+done
+
 cargo build --release --manifest-path "$ROOT/Cargo.toml"
 
 echo "==> 写入 $UNIT"

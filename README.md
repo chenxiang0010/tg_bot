@@ -67,6 +67,12 @@ sudo apt install cmake git g++ libclang-dev
 `deploy/install.sh` 会先检查这几个，缺了直接给出安装命令再退出。rlottie 是**静态链入**的，
 编出来的二进制运行时不需要它，只多一个 `libstdc++.so.6`。
 
+> rlottie-sys 的构建脚本把上游源码 clone 到 `target/` 里再 cherry-pick 一个补丁，
+> 而它的构建脚本**不能重复跑**：跑第二遍时补丁改过的文件成了「本地修改」，
+> git 会拒绝再打一次补丁（`your local changes would be overwritten by cherry-pick`）。
+> `deploy/install.sh` 在编译前会把那份缓存复位回干净的 `v0.2`；手工编译遇到这个报错，
+> 对着那个目录 `git reset --hard v0.2` 就行，或者 `cargo clean -p rlottie-sys` 重新 clone。
+
 动图转换用的是 **ffmpeg-next**（libav* 的 Rust 绑定），编解码在进程内完成，不起子进程。
 所以构建期还需要 ffmpeg 的开发头文件：
 
