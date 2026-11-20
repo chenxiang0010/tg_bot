@@ -18,11 +18,12 @@ image = { version = "0.25", default-features = false, features = [
     "gif",
 ] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
-ffmpeg-next = "8.1"
+ffmpeg-next = "9.1"
 rlottie = "0.5"
 flate2 = "1"
 anyhow = "1"
 dotenvy = "0.15"
 futures = "0.3"
 log = "0.4"
+mime = "0.3"
 pretty_env_logger = "0.5"

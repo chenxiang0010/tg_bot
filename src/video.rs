@@ -44,6 +44,13 @@ pub struct Gif {
     pub fps: u32,
 }
 
+/// 动图的第一帧，编码成 PNG。
+pub struct Still {
+    pub bytes: Vec<u8>,
+    /// 实际输出的边长。小图不会被放大，所以可能比请求的 size 小。
+    pub size: u32,
+}
+
 /// 送进转换流水线的输入。数据是 owned 的，方便整个转换丢进阻塞线程池。
 pub enum Input {
     /// 已编码的容器（webm / mp4 / gif），让 libavformat 自己 demux。
@@ -83,6 +90,285 @@ pub async fn to_gif(ff: Ffmpeg, input: Input, ladder: &[(u32, u32)], limit: usiz
     tokio::task::spawn_blocking(move || run_ladder(ff, &input, &ladder, limit))
         .await
         .context("转换任务被中断")?
+}
+
+/// 抽动图的第一帧，编码成 PNG。
+///
+/// 用途：Telegram 的动图贴纸本来都带缩略图，但那是服务端的行为、没写进文档。
+/// 万一没有缩略图，总得有个办法拿到一张静态图 —— 把原始 webm/tgs 丢给图片解码器
+/// 是解不开的，只能靠 libav 自己抽帧。
+pub async fn to_still(ff: Ffmpeg, input: Input, size: u32) -> Result<Still> {
+    if !ff.available {
+        bail!("libav 没初始化好，动图抽不了帧");
+    }
+    tokio::task::spawn_blocking(move || still(ff, &input, size))
+        .await
+        .context("抽帧任务被中断")?
+}
+
+/// 抽帧的滤镜链：只取第一帧 → 等比缩放（不放大）→ 透明边补成正方形。
+///
+/// 和 GIF 那条链的区别：不抽帧率、不做调色板，直接出 RGBA 交给 PNG 编码器。
+fn still_filter_spec(size: u32) -> String {
+    format!(
+        "select='eq(n\\,0)',\
+         scale='min(iw,{size})':'min(ih,{size})':force_original_aspect_ratio=decrease:flags=lanczos,\
+         format=rgba,\
+         pad='max(iw,ih)':'max(iw,ih)':(ow-iw)/2:(oh-ih)/2:color=#00000000"
+    )
+}
+
+/// 从已编码的容器里抽第一帧。
+fn still_encoded(ff: Ffmpeg, data: &[u8], vp9: bool, size: u32) -> Result<Vec<u8>> {
+    let mut source = memio::Reader::open(data)?;
+
+    let (stream_index, time_base, parameters) = {
+        let ictx = source.context();
+        let stream = ictx
+            .streams()
+            .best(media::Type::Video)
+            .context("这个文件里没有视频流")?;
+        (stream.index(), stream.time_base(), stream.parameters())
+    };
+
+    let ctx = codec::context::Context::from_parameters(parameters).context("读取流参数失败")?;
+    let mut decoder = if vp9 && ff.libvpx_vp9 {
+        let vpx = decoder::find_by_name("libvpx-vp9").context("找不到 libvpx-vp9")?;
+        ctx.decoder()
+            .open_as(vpx)
+            .context("打开 libvpx-vp9 解码器失败")?
+            .video()
+    } else {
+        ctx.decoder().video()
+    }
+    .context("打开解码器失败")?;
+
+    // 滤镜图：解出来的帧 → 缩放补方 → buffersink
+    let mut graph = filter::Graph::new();
+    let mut first_size: Option<(u32, u32)> = None;
+    let mut out_png: Option<Vec<u8>> = None;
+
+    for (stream, packet) in source.context().packets() {
+        if stream.index() != stream_index {
+            continue;
+        }
+        decoder.send_packet(&packet).context("送包给解码器失败")?;
+        let mut decoded = frame::Video::empty();
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            if first_size.is_none() {
+                first_size = Some((decoded.width(), decoded.height()));
+                let (w, h) = first_size.unwrap();
+                let av_fmt: ffi::AVPixelFormat = decoded.format().into();
+                let args = format!(
+                    "video_size={w}x{h}:pix_fmt={}:time_base={}/{}:pixel_aspect=1/1",
+                    av_fmt as i32,
+                    time_base.numerator(),
+                    time_base.denominator()
+                );
+                graph
+                    .add(
+                        &filter::find("buffer").context("没有 buffer 滤镜")?,
+                        "in",
+                        &args,
+                    )
+                    .context("创建滤镜输入失败")?;
+                graph
+                    .add(
+                        &filter::find("buffersink").context("没有 buffersink 滤镜")?,
+                        "out",
+                        "",
+                    )
+                    .context("创建滤镜输出失败")?;
+                graph
+                    .output("in", 0)
+                    .and_then(|p| p.input("out", 0))
+                    .and_then(|p| p.parse(&still_filter_spec(size)))
+                    .map_err(|e| anyhow!("解析滤镜链失败：{e}"))?;
+                graph.validate().context("滤镜链校验失败")?;
+            }
+            graph
+                .get("in")
+                .context("找不到滤镜输入")?
+                .source()
+                .add(&decoded)
+                .context("喂帧给滤镜失败")?;
+
+            // 取滤镜吐出来的帧
+            let mut filtered = frame::Video::empty();
+            if graph
+                .get("out")
+                .context("找不到滤镜输出")?
+                .sink()
+                .frame(&mut filtered)
+                .is_err()
+            {
+                continue;
+            }
+            out_png = Some(encode_png(&filtered)?);
+            break;
+        }
+        if out_png.is_some() {
+            break;
+        }
+    }
+
+    out_png.context("动图里一帧都没解出来")
+}
+
+/// 从 PNG 的 IHDR 里读出实际宽高。
+///
+/// 小图不会被放大，滤镜链补方后的边长可能比请求的小，
+/// 所以尺寸得从实际产出的字节里读，而不是用请求值。
+fn png_size(bytes: &[u8]) -> Result<(u32, u32)> {
+    const IHDR: &[u8] = b"IHDR";
+    if bytes.len() < 24 || &bytes[12..16] != IHDR {
+        bail!("这不是 PNG");
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+    Ok((width, height))
+}
+
+/// 把一帧 RGBA 编码成 PNG。
+fn encode_png(frame: &frame::Video) -> Result<Vec<u8>> {
+    let codec = encoder::find(codec::Id::PNG).context("没有 PNG 编码器")?;
+    let mut enc = codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()
+        .context("创建 PNG 编码器失败")?;
+    enc.set_width(frame.width());
+    enc.set_height(frame.height());
+    enc.set_format(Pixel::RGBA);
+    enc.set_time_base(Rational::new(1, 1));
+    let mut encoder = enc.open_as(codec).context("打开 PNG 编码器失败")?;
+
+    let (octx, dyn_buf) = memio::open_output("image2pipe")?;
+    let mut octx = octx;
+    let mut stream = octx.add_stream(codec).context("给 PNG 加输出流失败")?;
+    stream.set_parameters(&encoder);
+    stream.set_time_base(Rational::new(1, 1));
+    octx.write_header().context("写 PNG 文件头失败")?;
+
+    let mut packet = ffmpeg_next::Packet::empty();
+    let send_frame = frame.clone();
+    encoder
+        .send_frame(&send_frame)
+        .context("送帧给 PNG 编码器失败")?;
+    encoder.send_eof().context("通知 PNG 编码器收尾失败")?;
+
+    let mut data = Vec::new();
+    loop {
+        match encoder.receive_packet(&mut packet) {
+            Ok(()) => {}
+            Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => break,
+            Err(ffmpeg_next::Error::Eof) => break,
+            Err(e) => bail!("取 PNG 编码结果失败：{e}"),
+        }
+        packet.set_stream(0);
+        packet.write_interleaved(&mut octx).context("写 PNG 失败")?;
+    }
+    octx.write_trailer().context("写 PNG 文件尾失败")?;
+
+    // dyn_buf 只能用 avio_close_dyn_buf 关；关完把 pb 置空，
+    // 否则 Output 的 drop 会再 close 一次。
+    let mut buf: *mut u8 = ptr::null_mut();
+    let len = unsafe { ffi::avio_close_dyn_buf(dyn_buf, &mut buf) };
+    unsafe { (*octx.as_mut_ptr()).pb = ptr::null_mut() };
+    if len <= 0 || buf.is_null() {
+        if !buf.is_null() {
+            unsafe { ffi::av_free(buf.cast()) };
+        }
+        bail!("PNG 输出是空的");
+    }
+    let bytes = unsafe { slice::from_raw_parts(buf, len as usize).to_vec() };
+    unsafe { ffi::av_free(buf.cast()) };
+    data.extend_from_slice(&bytes);
+    Ok(data)
+}
+
+/// 动图抽第一帧成 PNG。
+fn still(ff: Ffmpeg, input: &Input, size: u32) -> Result<Still> {
+    let bytes = match input {
+        Input::Encoded { data, vp9 } => still_encoded(ff, data, *vp9, size)?,
+        Input::RawBgra {
+            data,
+            width,
+            height,
+            fps: src_fps,
+        } => {
+            // rlottie 的裸帧：直接取第一帧，走 GIF 那条链的解码逻辑再抽帧太绕，
+            // 这里自己取第一块 BGRA 交给滤镜图
+            let width = *width;
+            let height = *height;
+            let stride = width as usize * 4;
+            let frame_bytes = stride * height as usize;
+            if frame_bytes == 0 || data.len() < frame_bytes {
+                bail!("裸帧数据长度 {} 和 {width}×{height} 对不上", data.len());
+            }
+            let mut graph = filter::Graph::new();
+            let av_fmt: ffi::AVPixelFormat = Pixel::BGRA.into();
+            let tb = Rational::new(1, (*src_fps).max(1) as i32);
+            let args = format!(
+                "video_size={width}x{height}:pix_fmt={}:time_base={}/{}:pixel_aspect=1/1",
+                av_fmt as i32,
+                tb.numerator(),
+                tb.denominator()
+            );
+            graph
+                .add(
+                    &filter::find("buffer").context("没有 buffer 滤镜")?,
+                    "in",
+                    &args,
+                )
+                .context("创建滤镜输入失败")?;
+            graph
+                .add(
+                    &filter::find("buffersink").context("没有 buffersink 滤镜")?,
+                    "out",
+                    "",
+                )
+                .context("创建滤镜输出失败")?;
+            graph
+                .output("in", 0)
+                .and_then(|p| p.input("out", 0))
+                .and_then(|p| p.parse(&still_filter_spec(size)))
+                .map_err(|e| anyhow!("解析滤镜链失败：{e}"))?;
+            graph.validate().context("滤镜链校验失败")?;
+
+            let mut frame = frame::Video::new(Pixel::BGRA, width, height);
+            let dst_stride = frame.stride(0);
+            {
+                let dst = frame.data_mut(0);
+                for row in 0..height as usize {
+                    let from = row * stride;
+                    dst[row * dst_stride..row * dst_stride + stride]
+                        .copy_from_slice(&data[from..from + stride]);
+                }
+            }
+            frame.set_pts(Some(0));
+            graph
+                .get("in")
+                .context("找不到滤镜输入")?
+                .source()
+                .add(&frame)
+                .context("喂帧给滤镜失败")?;
+
+            let mut filtered = frame::Video::empty();
+            graph
+                .get("out")
+                .context("找不到滤镜输出")?
+                .sink()
+                .frame(&mut filtered)
+                .context("滤镜没吐出帧")?;
+            encode_png(&filtered)?
+        }
+    };
+    // 尺寸从实际产出的 PNG 里读：小图不放大，补方后可能比请求的小
+    let (width, height) = png_size(&bytes)?;
+    Ok(Still {
+        bytes,
+        size: width.max(height),
+    })
 }
 
 fn run_ladder(ff: Ffmpeg, input: &Input, ladder: &[(u32, u32)], limit: usize) -> Result<Gif> {
@@ -382,7 +668,7 @@ impl Encoded {
         enc.set_time_base(time_base);
         let encoder = enc.open_as(codec).context("打开 GIF 编码器失败")?;
 
-        let (octx, dyn_buf) = memio::open_gif_output()?;
+        let (octx, dyn_buf) = memio::open_output("gif")?;
         let mut me = Self {
             encoder,
             octx,
@@ -633,22 +919,22 @@ mod memio {
         }
     }
 
-    /// 建一个写到内存的 GIF 输出上下文。
+    /// 建一个写到内存的输出上下文。
     ///
     /// 返回的 `AVIOContext` 由调用方用 `avio_close_dyn_buf` 收尾，并且**必须**在此之后
     /// 把 `octx.pb` 置空 —— 否则 Output 的 Drop 会再 close 一次。
-    pub fn open_gif_output() -> Result<(fmt_ctx::Output, *mut ffi::AVIOContext)> {
+    pub fn open_output(name: &str) -> Result<(fmt_ctx::Output, *mut ffi::AVIOContext)> {
         unsafe {
-            let name = CString::new("gif").expect("字面量没有 nul");
+            let c_name = CString::new(name).expect("格式名没有 nul");
             let mut ptr_ctx = ptr::null_mut();
             let err = ffi::avformat_alloc_output_context2(
                 &mut ptr_ctx,
                 ptr::null_mut(),
-                name.as_ptr(),
+                c_name.as_ptr(),
                 ptr::null(),
             );
             if err < 0 || ptr_ctx.is_null() {
-                bail!("创建 GIF 输出上下文失败：{}", av_err(err));
+                bail!("创建 {name} 输出上下文失败：{}", av_err(err));
             }
 
             let mut pb = ptr::null_mut();
@@ -722,5 +1008,82 @@ mod tests {
         let ff = probe();
         assert!(ff.available, "GIF 编码器应当可用");
         assert!(ff.libvpx_vp9, "缺 libvpx-vp9 的话视频贴纸会丢透明通道");
+    }
+
+    /// 抽帧滤镜链：只取第一帧，等比缩放后补成正方形。
+    #[test]
+    fn still_filter_takes_first_frame_and_pads() {
+        let f = still_filter_spec(256);
+        assert!(f.contains("select='eq(n\\,0)'"), "只该取第一帧：{f}");
+        // 不放大
+        assert!(f.contains("min(iw,256)"));
+        assert!(f.contains("force_original_aspect_ratio=decrease"));
+        // 补方 + 透明底
+        assert!(f.contains("pad='max(iw,ih)':'max(iw,ih)'"));
+        assert!(f.contains("color=#00000000"));
+        // 抽帧这条链不该带调色板（那是 GIF 才需要的）
+        assert!(!f.contains("palettegen"));
+        assert!(!f.contains("paletteuse"));
+    }
+
+    /// 从裸帧里抽第一帧，产出的是合法 PNG。
+    ///
+    /// 用一张 64×64 的纯色 BGRA 图，验证整条「滤镜 → PNG 编码 → 内存缓冲」链路。
+    #[test]
+    fn still_from_raw_frames_produces_a_valid_png() {
+        let ff = probe();
+        if !ff.available {
+            return; // libav 不可用时跳过
+        }
+        let (w, h) = (64u32, 64u32);
+        let mut data = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w * h {
+            // 不透明的红，BGRA 顺序
+            data.extend_from_slice(&[0, 0, 255, 255]);
+        }
+        let out = still(
+            ff,
+            &Input::RawBgra {
+                data,
+                width: w,
+                height: h,
+                fps: 60,
+            },
+            128,
+        )
+        .expect("抽帧应该成功");
+
+        assert!(!out.bytes.is_empty(), "PNG 不该是空的");
+        // PNG magic
+        assert_eq!(
+            &out.bytes[..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+        // IHDR 里的宽高：64 的图不会被放大，补方后还是 64×64
+        let width = u32::from_be_bytes(out.bytes[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(out.bytes[20..24].try_into().unwrap());
+        assert_eq!((width, height), (64, 64));
+        // size 报的是实际尺寸，不是请求的 128
+        assert_eq!(out.size, 64);
+    }
+
+    /// 裸帧数据长度对不上时要报错，不能 panic。
+    #[test]
+    fn still_rejects_mismatched_raw_frame_data() {
+        let ff = probe();
+        if !ff.available {
+            return;
+        }
+        let err = still(
+            ff,
+            &Input::RawBgra {
+                data: vec![0u8; 10],
+                width: 64,
+                height: 64,
+                fps: 60,
+            },
+            128,
+        );
+        assert!(err.is_err(), "长度对不上应该报错");
     }
 }
